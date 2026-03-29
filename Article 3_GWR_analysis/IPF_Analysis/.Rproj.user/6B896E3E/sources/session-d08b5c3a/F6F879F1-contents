@@ -1,0 +1,782 @@
+# Load necessary libraries
+library(tidyverse)
+library(sf)
+library(spdep)
+library(spatialreg)
+library(tmap)
+library(vtable)
+
+library(car)      # For VIF calculation
+library(corrplot) # For the visual correlation matrix
+
+library(gtsummary)
+
+# 1. Load your Master Data
+df <- read.csv("../Thames_Estuary_Master.csv")
+
+df$log_price <- log(df$Price)
+
+# 2. Ensure factors are correctly typed for the model
+df$property_type <- as.factor(df$Property.Type)
+df$energy_rating <- as.factor(df$CURRENT_ENERGY_RATING)
+
+# 3. Rename newly merged variables for cleaner tables
+df <- df %>% 
+  rename(
+    income_after_housing = `Disposable..net..annual.income.after.housing.costs....`,
+    travel_time_employment = `X100EmpPTt`,
+    elevation = elevation_m
+  )
+
+
+
+# 3. Recode the flood_zone variable
+df <- df %>%
+  mutate(Risk_Level = case_when(
+    flood_zone == "FZ3" ~ "High Risk (FZ3)",
+    flood_zone == "FZ2" ~ "Medium Risk (FZ2)",
+    TRUE ~ "No Risk" # Categorizes everything else as No Risk
+  )) %>%
+  # Convert to a factor with a logical order for the table
+  mutate(Risk_Level = factor(Risk_Level, levels = c("No Risk", "Medium Risk (FZ2)", "High Risk (FZ3)")))
+
+# 2. Update all variables to numeric where needed to avoid errors
+df <- df %>%
+  mutate(
+    Price = as.numeric(Price),
+    TOTAL_FLOOR_AREA = as.numeric(TOTAL_FLOOR_AREA),
+    elevation_m = as.numeric(elevation),
+    dist_river_m = as.numeric(dist_river_m),
+    income_after_housing = as.numeric(income_after_housing),
+    travel_time_employment = as.numeric(`travel_time_employment`)
+  )
+
+
+# Generate the stratified table
+table1_final <- df %>%
+  select(pmu, Price, TOTAL_FLOOR_AREA, PROPERTY_TYPE, CURRENT_ENERGY_RATING, income_after_housing, 
+         travel_time_employment, Risk_Level, elevation, dist_river_m) %>%
+  tbl_summary(
+    by = pmu, 
+    statistic = list(
+      all_continuous() ~ "{mean} ({sd}) \n ({min}, {max})",
+      all_categorical() ~ "{n} ({p}%)"
+    ),
+    digits = all_continuous() ~ 2,
+    label = list(
+      Price ~ "Sale Price (£)",
+      TOTAL_FLOOR_AREA ~ "Floor Area (m2)",
+      PROPERTY_TYPE ~ "Property Types",
+      CURRENT_ENERGY_RATING ~ "Energy Ratings (A-E)",
+      income_after_housing ~ "Net Annual Income (£)",
+      travel_time_employment ~ "Travel Time (min)",
+      Risk_Level ~ "Flood Risk Classification",
+      elevation ~ "Elevation (m)",
+      dist_river_m ~ "Distance to River (m)"
+    )
+  ) %>%
+  add_overall() %>%
+  modify_header(label = "**Variables**") %>%
+  bold_labels()
+
+# Display the table
+table1_final
+
+
+# ================ Table 2: Correlation & VIF =============================
+
+# 1. Prepare data for Correlation (Numeric only)
+# We convert Risk_Level to numeric (1, 2, 3) to see its linear association
+cor_data <- df %>%
+  select(Price, TOTAL_FLOOR_AREA, elevation, dist_river_m, 
+         income_after_housing, travel_time_employment, pmu) %>%
+  mutate(across(everything(), as.numeric))
+
+# 2. Generate Pearson Correlation Matrix
+cor_matrix <- cor(cor_data, use = "complete.obs")
+
+# Display the matrix with 2 decimal places
+print("--- Pearson Correlation Matrix ---")
+print(round(cor_matrix, 2))
+
+# 3. Formulate the Global Model for VIF Testing
+# We include ALL controls: Structural, Neighbourhood, Climate, and PMU fixed effects
+vif_formula <- log_price ~ TOTAL_FLOOR_AREA + PROPERTY_TYPE + 
+  income_after_housing + travel_time_employment + 
+  Risk_Level + elevation + dist_river_m + pmu 
+
+vif_model <- lm(vif_formula, data = df)
+
+# 4. Calculate Variance Inflation Factor (VIF)
+# For categorical variables with multiple levels (like PMU), R uses 'GVIF'
+vif_results <- vif(vif_model)
+
+print("--- Variance Inflation Factor (VIF) Results ---")
+print(vif_results)
+
+
+# =================== Table 4: Spatial Errors ====================
+
+library(spdep)
+
+# 1. Clean and convert coordinates to a strictly numeric matrix
+# Ensure we use the original Easting/Northing columns from your join
+coords <- df %>%
+  select(oseast1m_x, osnrth1m_x) %>%
+  mutate(across(everything(), ~as.numeric(as.character(.)))) %>%
+  as.matrix()
+
+# 2. Check for any NA values that might have been created during conversion
+if(any(is.na(coords))) {
+  print("Warning: NA coordinates found. Removing rows with missing spatial data.")
+  df <- df[!is.na(df$oseast1m) & !is.na(df$osnrth1m), ]
+  coords <- as.matrix(df[, c("oseast1m", "osnrth1m")])
+}
+
+# 1. Add a tiny amount of 'jitter' to handle identical points (flats in same building)
+# 0.01 meters is enough to separate points without affecting spatial accuracy
+coords_jittered <- jitter(coords, amount = 0.01)
+
+# 2. Run knearneigh again with the jittered coordinates
+knn <- knearneigh(coords_jittered, k = 8)
+nb <- knn2nb(knn)
+lw <- nb2listw(nb, style = "W")
+
+print("Spatial weights matrix successfully created.")
+
+
+# 2. Run the Global OLS Model (Baseline)
+# Including your new structural and neighbourhood controls
+ols_model <- lm(log_price ~ TOTAL_FLOOR_AREA + PROPERTY_TYPE + CURRENT_ENERGY_RATING +
+                  income_after_housing + travel_time_employment + 
+                  Risk_Level + elevation + dist_river_m + pmu, 
+                data = df)
+
+# 3. Perform Moran's I Test on OLS Residuals
+# If p < 0.001, OLS is misspecified and spatial models are required
+moran_results <- lm.morantest(ols_model, lw)
+print(moran_results)
+
+
+
+
+# 1. Create a "Clean" dataframe with no missing values for the model
+df_clean <- df %>%
+  select(log_price, TOTAL_FLOOR_AREA, PROPERTY_TYPE, CURRENT_ENERGY_RATING,
+         income_after_housing, travel_time_employment, 
+         Risk_Level, elevation, dist_river_m, pmu,
+         oseast1m_x, osnrth1m_x) %>%
+  drop_na() # This ensures the row count matches exactly
+
+# 3. Re-create the Weights Matrix for the clean data only
+coords_clean <- cbind(df_clean$oseast1m, df_clean$osnrth1m)
+coords_jittered <- jitter(coords_clean, amount = 0.01)
+knn_clean <- knearneigh(coords_jittered, k = 8)
+nb_clean <- knn2nb(knn_clean)
+lw_clean <- nb2listw(nb_clean, style = "W", zero.policy = TRUE)
+
+# 4. Run the Moran's Test again
+moran_results <- lm.morantest(ols_model_clean, lw_clean, zero.policy = TRUE)
+print(moran_results)
+
+
+# These test for spatial lag and spatial error dependencies
+rs_tests <- lm.RStests(ols_model_clean, lw_clean, 
+                       test = c("RSerr", "RSlag", "adjRSerr", "adjRSlag"))
+
+print(summary(rs_tests))
+
+
+# ============ Table 4: Comparism of OLS, SDM, SEM ==========
+
+library(spatialreg)
+library(spam)
+library(Matrix)
+
+# Define the full model formula
+# log_price is your dependent variable
+# Risk_Level (3-levels), income, and travel time are your key predictors
+form <- log_price ~ TOTAL_FLOOR_AREA + PROPERTY_TYPE +
+  income_after_housing + travel_time_employment + 
+  Risk_Level + elevation + dist_river_m
+
+# A. OLS Model (The non-spatial baseline)
+ols_mod <- lm(form, data = df_clean)
+
+# Rebuild the weights matrix as Symmetric (Binary)
+# This allows the 'Matrix' method to handle the 73k rows without crashing
+# 1. Force the neighbor list to be strictly symmetric
+nb_sym <- make.sym.nb(nb_clean)
+lw_sym_final <- nb2listw(nb_sym, style = "B", zero.policy = TRUE)
+
+# B. Spatial Error Model (SEM)
+# 1. Update the SEM model using Sparse Matrix (Matrix) approach
+# This avoids creating the 31Gb dense matrix
+sem_mod <- errorsarlm(
+  formula(ols_mod), 
+  data = df_clean, 
+  listw = lw_sym_final, 
+  method = "Matrix",       # Uses sparse matrix algebra
+  zero.policy = TRUE
+)
+
+# C. Spatial Durbin Model (SDM)
+# 2. Update the SDM model similarly
+sdm_mod <- lagsarlm(
+  formula(ols_mod), 
+  data = df_clean, 
+  listw = lw_sym_final, 
+  method = "Matrix",       # Vital for datasets > 10k rows
+  zero.policy = TRUE
+)
+
+# 3. Compare Model Fit for Table 4
+summary(sem_mod)
+summary(sdm_mod)
+
+# Summary for Table 4 comparison
+summary(ols_mod)
+summary(sem_mod)
+summary(sdm_mod)
+
+
+
+# ========= GWR Coding =====================
+
+library(GWmodel)
+
+# 1. Convert your cleaned data to a Spatial Object
+# We use the 'sp' format required by the GWmodel package
+df_sp <- SpatialPointsDataFrame(coords = coords_clean, data = df_clean, 
+                                proj4string = CRS("EPSG:27700"))
+
+# 2. Select the optimal Bandwidth (This is computationally intensive)
+# We use AICc to find the balance between model fit and complexity
+bw_adaptive <- bw.gwr(log_price ~ TOTAL_FLOOR_AREA + PROPERTY_TYPE + 
+                        income_after_housing + travel_time_employment + 
+                        Risk_Level + elevation + dist_river_m, 
+                      data = df_sp, 
+                      approach = "AIC", 
+                      kernel = "bisquare", 
+                      adaptive = TRUE)
+
+print(paste("Optimal Number of Neighbors (Bandwidth):", bw_adaptive))
+
+
+# 1. Stop the current process (Esc) if it hasn't already terminated
+# 2. Run the GWR model with the most stable 'optimal' bandwidth
+gwr_model_final <- gwr.basic(log_price ~ TOTAL_FLOOR_AREA + PROPERTY_TYPE + 
+                               income_after_housing + travel_time_employment + 
+                               Risk_Level + elevation + dist_river_m, 
+                             data = df_sp, 
+                             bw = 10000,      # Rounded from your last successful iteration
+                             kernel = "bisquare", 
+                             adaptive = TRUE)
+
+ # 3. Save the object immediately
+saveRDS(gwr_model_final, "IPF_Thames_GWR_Result.rds")
+
+# 4. Extract the Summary for Table 5
+summary(gwr_model_final$SDF)
+
+
+# ======= Creating the Figure 4 table ==========
+
+library(tmap)
+library(sf)
+library(RColorBrewer)
+
+library(tmap)
+library(sf)
+
+
+# Reworking on the GWR outputs
+
+library(GWmodel)
+library(spgwr)
+library(tmap)
+library(sf)
+
+gwr_model_final <- readRDS("IPF_Thames_GWR_Result.rds")
+
+summary(gwr_model_final$SDF)
+
+# 1. Convert GWR SpatialPointsDataFrame to 'sf'
+gwr_sf <- st_as_sf(gwr_model_final$SDF)
+
+# 2. Set tmap mode to 'plot' for static high-res output
+tmap_mode("plot")
+
+# 1. Load the shapefile
+library(sf)
+
+# 1. Path to the specific .shp file
+pmu_file_path <- "../Thames_Estuary_2100_Policy_Unit_Boundaries/Thames_Estuary_2100_Policy_Unit_BoundariesPolygon.shp"
+
+# 2. Load the object
+pmu_shp <- st_read(pmu_file_path)
+
+# 3. VERIFY: You should see columns like "UNIT_NAME" or "POLICY_UNIT" now
+print(colnames(pmu_shp))
+
+
+# 2. STEP A: Set the initial CRS (Since it's NA, we tell R it is 27700 based on the bounding box)
+st_crs(pmu_shp) <- 27700
+
+# 3. STEP B: Match the GWR CRS exactly (This is the equivalent of .to_crs)
+pmu_shp <- st_transform(pmu_shp, st_crs(gwr_sf))
+
+# If this is TRUE, they are now mathematically identical
+print(st_crs(pmu_shp) == st_crs(gwr_sf))
+
+
+tmap_mode("plot")
+
+# Ensure CRS match
+st_crs(pmu_shp) <- st_crs(gwr_sf)
+
+
+# Extract GWR coefficient
+gwr_sf$FZ3_Beta <- gwr_model_final$SDF$`Risk_LevelHigh Risk (FZ3)`
+
+# Define fixed bins (stronger contrast)
+breaks_vals <- c(-0.47, -0.05, -0.02, 0.01, 0.08, 0.23)
+
+fig4_final <-
+  
+  tm_basemap("CartoDB.Positron") +
+  
+  tm_shape(pmu_shp) +
+  tm_borders(
+    col = "black",
+    lwd = 1.6,
+    alpha = 0.8
+  ) +
+  
+  tm_shape(gwr_sf) +
+  tm_dots(
+    fill = "FZ3_Beta",
+    
+    fill.scale = tm_scale_intervals(
+      breaks = breaks_vals,
+      values = "-RdYlGn"   # stronger palette
+    ),
+    
+    size = 0.07,
+    fill_alpha = 0.95,
+    
+    fill.legend = tm_legend(
+      title = "Local Flood Risk Impact (β)",
+      position = c("right","bottom")
+    )
+  ) +
+  
+  tm_compass(
+    type = "arrow",
+    position = c("left","top"),
+    size = 2
+  ) +
+  
+  tm_layout(
+    
+    title = "Figure 4: Spatial Heterogeneity of Flood Risk Pricing",
+    title.position = c("center","top"),
+    title.size = 1.6,
+    
+    frame = FALSE,
+    
+    # Remove white margins
+    outer.margins = 0,
+    inner.margins = 0,
+    
+    # Legend inside map
+    legend.outside = FALSE,
+    legend.position = c("right","bottom"),
+    
+    legend.bg.color = "white",
+    legend.bg.alpha = 0.9,
+    
+    legend.title.size = 1.2,
+    legend.text.size = 1.0
+  )
+
+tmap_save(
+  fig4_final,
+  "Figure4_GWR_Journal_Final.png",
+  width = 14,
+  height = 6,
+  dpi = 600
+)
+
+fig4_final
+
+
+
+
+
+
+
+# --------------------------------------------------------
+
+
+tmap_mode("plot")
+
+# Ensure CRS matches
+st_crs(pmu_shp) <- st_crs(gwr_sf)
+
+# Extract GWR coefficient
+gwr_sf$FZ3_Beta <- gwr_model_final$SDF$`Risk_LevelHigh Risk (FZ3)`
+
+# Fixed bins for strong legend readability
+breaks_vals <- c(-0.47, -0.05, -0.02, 0.005, 0.08, 0.23)
+
+fig4_clean <- 
+  
+  tm_basemap("CartoDB.PositronNoLabels") +   # much quieter basemap
+  
+  tm_shape(pmu_shp) +
+  tm_borders(
+    col = "black",
+    lwd = 1.8
+  ) +
+  
+  tm_shape(gwr_sf) +
+  tm_symbols(
+    col = "FZ3_Beta",
+    
+    palette = "-RdYlGn",
+    
+    style = "fixed",
+    breaks = breaks_vals,
+    
+    size = 0.12,          # MUCH larger points
+    alpha = 1,            # remove transparency
+    
+    legend.col.show = TRUE
+  ) +
+  
+  tm_compass(
+    type = "arrow",
+    position = c("left","top"),
+    size = 2
+  ) +
+  
+  # Title placed manually
+  tm_credits(
+    "Figure 4: Spatial Heterogeneity of Flood Risk Pricing",
+    position = c("center","top"),
+    size = 1.3,
+    fontface = "bold"
+  ) +
+  
+  tm_layout(
+    
+    frame = FALSE,
+    
+    inner.margins = c(0,0,0,0),
+    outer.margins = c(0,0,0,0),
+    
+    legend.position = c("right","bottom"),
+    
+    legend.bg.color = "white",
+    legend.bg.alpha = 1,
+    
+    legend.title.size = 1.2,
+    legend.text.size = 1.0
+  )
+
+tmap_save(
+  fig4_clean,
+  "Figure4_GWR_FINAL_PUBLICATION.png",
+  width = 14,
+  height = 6,
+  dpi = 600
+)
+
+fig4_clean
+
+
+# -------- Producing table 6 ---------------
+
+# 1. Spatial Join: Tag houses with PMU names and policy definitions
+gwr_sf <- st_as_sf(gwr_model_final$SDF)
+pmu_shp <- st_transform(pmu_shp, st_crs(gwr_sf))
+gwr_joined <- st_join(gwr_sf, pmu_shp)
+
+# 2. Create Table 6: The Critical Examination Summary
+table_6 <- gwr_joined %>%
+  st_drop_geometry() %>%
+  group_by(pmu, policy_def) %>% 
+  summarise(
+    N_Properties = n(),
+    Median_FZ3_Beta = median(`Risk_LevelHigh Risk (FZ3)`, na.rm = TRUE),
+    Median_Local_R2 = median(Local_R2, na.rm = TRUE),
+    # Calculate % of properties where the flood impact is statistically significant
+    Significance_Rate = mean(abs(`Risk_LevelHigh Risk (FZ3)_TV`) > 1.96, na.rm = TRUE) * 100
+  ) %>%
+  arrange(Median_FZ3_Beta) # Rank from highest discount to highest premium
+
+print(table_6)
+write.csv(table_6, "Table6_PMU_Analysis.csv", row.names = FALSE)
+
+
+# ------------  Table 5: -------------------
+
+# 1. Get Global Model (SEM) Diagnostics
+# Replace 'sem_model' with the name of your previous global model object
+global_aicc <- AIC(sem_mod) 
+global_r2 <- summary(sem_mod)$adj.r.squared
+
+# 2. Get GWR Model Diagnostics (from your 64,947 properties)
+local_aicc <- gwr_model_final$results$AICc
+local_r2 <- gwr_model_final$results$R2adj
+
+# 3. Create Table 5
+table_5 <- data.frame(
+  Metric = c("AICc (Lower is Better)", "Adjusted R-Squared"),
+  Global_SEM = c(global_aicc, global_r2),
+  Local_GWR = c(local_aicc, local_r2)
+)
+
+print(table_6)
+write.csv(table_5, "Table5_Model_Comparison.csv")
+
+
+
+
+# 1. Initialize placeholders
+g_r2   <- NA
+g_aicc <- NA
+
+# 2. Extract from sem_mod (The Global Model)
+if (exists("sem_mod")) {
+  summ <- summary(sem_mod)
+  
+  # Try all common R-squared locations for spatial models
+  if (length(summ$adj.r.squared) > 0) { g_r2 <- summ$adj.r.squared }
+  else if (length(summ$NK) > 0) { g_r2 <- summ$NK }
+  
+  # Try AIC
+  aic_val <- AIC(sem_mod)
+  if (length(aic_val) > 0) { g_aicc <- aic_val }
+}
+
+# 3. Extract from GWR (The Local Model)
+l_r2   <- gwr_model_final$results$R2adj
+l_aicc <- gwr_model_final$results$AICc
+
+# 4. Create Table 5 - Using as.numeric to flatten any remaining lists
+table_5 <- data.frame(
+  Metric = c("Adjusted R-Squared", "AICc (Lower is Better)"),
+  Global_Model = c(as.numeric(g_r2), as.numeric(g_aicc)),
+  Local_GWR = c(as.numeric(l_r2), as.numeric(l_aicc))
+)
+
+print(table_5)
+write.csv(table_5, "Table5_Model_Comparison.csv", row.names = FALSE)
+
+
+# ------ Figure 5 ------
+
+library(tmap)
+library(sf)
+
+# 1. Convert GWR results to sf object
+gwr_sf <- st_as_sf(gwr_model_final$SDF)
+
+# 2. Plot High-Resolution Reliability Map
+tmap_mode("plot")
+fig5 <- tm_shape(gwr_sf) +
+  tm_dots(col = "Local_R2", 
+          palette = "YlOrRd", 
+          title = "Local R-Squared",
+          style = "quantile", 
+          size = 0.02, 
+          alpha = 0.5) +
+  tm_shape(pmu_shp) + # Your PMU boundaries
+  tm_borders(lwd = 1.2, col = "black") +
+  tm_layout(main.title = "Figure 5: GWR Model Explanatory Power",
+            legend.outside = TRUE, 
+            frame = FALSE)
+
+# Save for your report
+tmap_save(fig5, "Figure5_Local_R2.png", dpi = 300)
+
+
+
+
+# 1. Ensure your GWR results are an sf object
+gwr_sf <- st_as_sf(gwr_model_final$SDF)
+
+# 2. Set tmap to "view" for interactive check or "plot" for the final image
+tmap_mode("plot")
+
+# 3. Create Figure 5 with Basemap
+fig5 <- tm_basemap(server = "CartoDB.Positron") + 
+  tm_shape(gwr_sf) +
+  tm_dots(col = "Local_R2", 
+          palette = "YlOrBr", 
+          title = "Local R-Squared",
+          style = "quantile", 
+          size = 0.01, 
+          alpha = 0.5,
+          zorder = 3) +
+  tm_shape(pmu_shp) + # Your 23 Policy Unit boundaries
+  tm_borders(lwd = 1.5, col = "black", zorder = 4) +
+  tm_layout(main.title = "Figure 2: GWR Model Explanatory Power",
+            legend.outside = TRUE)
+
+# Save high-resolution version
+tmap_save(fig5, "Figure5_Reliability_Map.png", dpi = 300)
+
+
+# -------- Figure 6: LISA -------------
+
+library(rgeoda)
+
+# 1. Run LISA (Local Moran's I)
+w <- knn_weights(gwr_sf, k = 8)
+lisa_res <- local_moran(w, gwr_sf["Risk_LevelHigh Risk (FZ3)"])
+gwr_sf$lisa_clusters <- as.factor(lisa_res$GetClusterIndicators())
+
+tmap_mode("plot")
+# 2. Plot with Contextual Basemap
+fig6 <- tm_basemap(server = "OpenStreetMap") +
+  tm_shape(gwr_sf) +
+  tm_dots(col = "lisa_clusters", 
+          palette = c("grey90", "blue", "red", "lightblue", "pink"),
+          labels = c("Not Sig", "High-High (Bubble)", "Low-Low (Rational)", "Low-High", "High-Low"),
+          title = "LISA Clusters",
+          size = 0.02,
+          zorder = 3) +
+  tm_shape(pmu_shp) +
+  tm_borders(lwd = 1, col = "black", zorder = 4) +
+  tm_layout(main.title = "Figure 6: Significant Risk Mispricing Clusters",
+            legend.outside = TRUE)
+
+# Save high-resolution version
+tmap_save(fig6, "Figure6_LISA_Map.png", dpi = 300)
+
+
+
+
+library(tmap)
+library(rgeoda)
+
+# 1. Plotting Figure 6 (High Resolution and Large Legend)
+tmap_mode("plot")
+fig6_large_legend <- tm_basemap(server = "CartoDB.Positron") +
+  tm_shape(gwr_sf) +
+  tm_dots(col = "lisa_clusters", 
+          palette = c("grey90", "blue", "red", "lightblue", "pink", "green"),
+          labels = c("Not Sig", "High-High (Bubble)", "Low-Low (Rational)", 
+                     "Low-High", "High-Low", "Undefined"),
+          title = "LISA Clusters (FZ3 Impact)",
+          size = 0.05,        # Slightly increase base dot size
+          zorder = 3,
+          # --- THE FIX ---
+          legend.kwds = list(
+            title.size = 1.8,      # Enlarge the legend title text
+            label.size = 1.5,      # Enlarge the cluster label text
+            symbol.size = 2.5      # Enlarge the legend symbols (the dots)
+          )) +
+  tm_shape(pmu_shp) +
+  tm_borders(lwd = 1.2, col = "black", zorder = 4) +
+  tm_layout(main.title = "Figure 3: Significant Flood Risk Mispricing Clusters",
+            main.title.size = 2.2, # Enlarge main title
+            legend.outside = TRUE, 
+            legend.outside.position = "right")
+
+# Save high-resolution version
+tmap_save(fig6_large_legend, "Figure6_LISA_LargeLegend.png", dpi = 300)
+
+
+
+
+library(tmap)
+library(sf)
+
+tmap_mode("plot")
+
+# Define fixed bins for strong contrast
+breaks_vals <- c(-0.47, -0.05, -0.02, 0.01, 0.08, 0.23)
+
+fig4_final <-
+  tm_basemap("CartoDB.Positron") +
+  # 1. PMU Boundaries
+  tm_shape(pmu_shp) +
+  tm_borders(col = "black", lwd = 1.6, alpha = 0.8) +
+  # 2. GWR Data Points
+  tm_shape(gwr_sf) +
+  tm_dots(
+    fill = "FZ3_Beta",
+    fill.scale = tm_scale_intervals(
+      breaks = breaks_vals,
+      values = "-RdYlGn"
+    ),
+    size = 0.07,           # Size of dots on the actual map
+    fill_alpha = 0.95,
+    # --- THE CRITICAL FIX FOR LEGEND CIRCUMFERENCE ---
+    fill.legend = tm_legend(
+      title = "Local Flood Risk Impact (β)",
+      symbol.size = 3,     # This forces the legend circles to be much larger
+      frame = TRUE,
+      bg.color = "white",
+      bg.alpha = 0.9,
+      title.size = 1.2,
+      text.size = 1.0,
+      position = c("right", "bottom")
+    )
+  ) +
+  # 3. North Arrow
+  tm_compass(type = "arrow", position = c("left", "top"), size = 2) +
+  # 4. Layout Settings
+  tm_layout(
+    # --- THE FIX FOR TITLE POSITION ---
+    main.title = "Figure 1: Spatial Heterogeneity of Flood Risk Pricing",
+    main.title.position = "center",
+    main.title.size = 1.6,
+    
+    frame = FALSE,
+    legend.outside = FALSE,
+    outer.margins = c(0.05, 0, 0, 0), # Adds space at the top for the title
+    inner.margins = 0
+  )
+
+# Save high-resolution version
+tmap_save(
+  fig4_final,
+  "Figure4_Corrected_Title_Legend.png",
+  width = 14,
+  height = 6,
+  dpi = 600
+)
+
+# Display
+fig4_fina
+
+library(spatialreg)
+
+# 1. Clean SEM Actuals
+sem_beta <- as.numeric(sem_mod$coefficients["Risk_LevelHigh Risk (FZ3)"])
+sem_aic  <- as.numeric(AIC(sem_mod))
+
+# 2. Clean GWR Actuals (Stripping the list structure)
+gwr_median_beta <- as.numeric(median(gwr_model_final$SDF$`Risk_LevelHigh Risk (FZ3)`, na.rm = TRUE))
+gwr_aicc        <- as.numeric(unlist(gwr_model_final$GW.diagnostic["AICc"]))
+gwr_r2_adj      <- as.numeric(unlist(gwr_model_final$GW.diagnostic["gw.R2adj"]))
+
+# 3. Handle the Pseudo R2 for SEM safely
+L_full <- as.numeric(logLik(sem_mod))
+L_null <- as.numeric(logLik(update(sem_mod, . ~ 1)))
+n_obs  <- length(sem_mod$residuals)
+sem_r2_pseudo <- (1 - exp(-2/n_obs * (L_full - L_null))) / (1 - exp(2/n_obs * L_null))
+
+# 4. Final Table Construction
+table_5_final <- data.frame(
+  Metric = c("AIC / AICc", "Adjusted / Pseudo R2", "FZ3 Impact (Beta)"),
+  Global_SEM = c(round(sem_aic, 2), round(sem_r2_pseudo, 4), round(sem_beta, 4)),
+  Local_GWR  = c(round(gwr_aicc, 2), round(gwr_r2_adj, 4), round(gwr_median_beta, 4))
+)
+
+print(table_5_final)

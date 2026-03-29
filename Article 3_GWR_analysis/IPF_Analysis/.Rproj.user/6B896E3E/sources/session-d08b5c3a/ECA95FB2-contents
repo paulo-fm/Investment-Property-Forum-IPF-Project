@@ -1,0 +1,5 @@
+# ======== This is Paulinus Ugwu's Script for STA 776 Assignment ===========
+
+set.seed(42) #Set seed to ensure reproducibility of the same numbers
+
+age <- sample(18:65, size = 10, replace = TRUE)  # Generates 10 samples of age ranging from 18 - 65

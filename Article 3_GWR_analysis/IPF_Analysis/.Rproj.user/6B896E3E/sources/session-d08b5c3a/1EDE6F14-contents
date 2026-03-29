@@ -1,0 +1,4 @@
+# ==== STA 776 Assignment ========================
+
+age <- rnorm(10, mean = 30, sd=4)
+
